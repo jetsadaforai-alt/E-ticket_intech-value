@@ -1,0 +1,14 @@
+# Reverse proxy + HTTPS อัตโนมัติ (Let's Encrypt) สำหรับเซิร์ฟเวอร์ที่รัน docker compose
+# ติดตั้ง: sudo cp deploy/Caddyfile.example /etc/caddy/Caddyfile  แล้วแก้โดเมน  แล้ว sudo systemctl reload caddy
+# ต้องชี้ DNS ของทั้งสองโดเมนมาที่ IP ของเครื่อง และเปิดพอร์ต 80/443 ก่อน Caddy จึงขอใบรับรองได้
+# (Socket.IO ของแชท/Support ผ่าน reverse_proxy ได้เลย ไม่ต้องตั้งค่าเพิ่ม)
+
+# Backend API — ใช้ URL นี้เป็น BACKEND_PUBLIC_URL และ EXPO_PUBLIC_API_BASE_URL ใน mobile/eas.json
+api.your-domain.example {
+	reverse_proxy localhost:3000
+}
+
+# เว็บหลังบ้าน (Admin / SuperAdmin)
+admin.your-domain.example {
+	reverse_proxy localhost:3001
+}

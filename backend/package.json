@@ -1,0 +1,37 @@
+{
+  "name": "e-ticket-backend",
+  "version": "0.1.0",
+  "private": true,
+  "type": "commonjs",
+  "main": "src/index.js",
+  "scripts": {
+    "dev": "node --watch src/index.js",
+    "start": "node src/index.js",
+    "prisma:generate": "prisma generate",
+    "prisma:migrate": "prisma migrate dev",
+    "prisma:deploy": "prisma migrate deploy",
+    "seed": "node prisma/seed.js",
+    "seed:demo": "node scripts/seedDemoData.js",
+    "pretest": "node scripts/prepare-test-db.js",
+    "test": "node --test --test-concurrency=1 test/*.test.js"
+  },
+  "prisma": {
+    "seed": "node prisma/seed.js"
+  },
+  "dependencies": {
+    "@prisma/client": "^5.19.1",
+    "bcryptjs": "^2.4.3",
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2",
+    "jsonwebtoken": "^9.0.2",
+    "luxon": "^3.5.0",
+    "multer": "^2.0.1",
+    "redis": "^4.7.0",
+    "socket.io": "^4.8.3",
+    "uuid": "^11.0.0"
+  },
+  "devDependencies": {
+    "prisma": "^5.19.1"
+  }
+}

@@ -1,0 +1,104 @@
+@import "tailwindcss";
+
+/* Brand tokens mirrored from mobile/src/theme.ts so admin-web reads as the same
+   product as the customer/vendor mobile app instead of a generic admin panel. */
+:root {
+  --background: #f8f9fa;
+  --foreground: #191c1d;
+  --primary: #00685f;
+  --primary-dark: #00453f;
+  --primary-soft: #e6f1ef;
+  --primary-pill: #caead6;
+  --danger: #ba1a1a;
+  --danger-dark: #8c1416;
+  --danger-bg: #fdecec;
+  --success: #1a7f37;
+  --success-bg: #e6f4ea;
+  --warning: #9a6700;
+  --warning-bg: #fff8c5;
+  --surface: #ffffff;
+  --border: #e1e3e4;
+  --border-strong: #bcc9c6;
+  --text-muted: #3d4947;
+  --neutral-bubble: #edeeef;
+
+  /* Admin-console-only status semantics — no mobile equivalent to mirror, since
+     these map to admin actions (support triage, account lockouts) mobile never shows. */
+  --info: #0b57d0;
+  --info-bg: #e8f0fe;
+  --orange: #b3540c;
+  --orange-bg: #fdece1;
+
+  /* Chart series colors, seeded from the same palette used everywhere else so
+     Recharts never introduces a one-off hue. */
+  --chart-1: #00685f;
+  --chart-2: #0b57d0;
+  --chart-3: #9a6700;
+  --chart-4: #1a7f37;
+
+  color-scheme: light;
+}
+
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-primary: var(--primary);
+  --color-primary-dark: var(--primary-dark);
+  --color-primary-soft: var(--primary-soft);
+  --color-primary-pill: var(--primary-pill);
+  --color-danger: var(--danger);
+  --color-danger-dark: var(--danger-dark);
+  --color-danger-bg: var(--danger-bg);
+  --color-success: var(--success);
+  --color-success-bg: var(--success-bg);
+  --color-warning: var(--warning);
+  --color-warning-bg: var(--warning-bg);
+  --color-info: var(--info);
+  --color-info-bg: var(--info-bg);
+  --color-orange: var(--orange);
+  --color-orange-bg: var(--orange-bg);
+  --color-surface: var(--surface);
+  --color-border: var(--border);
+  --color-border-strong: var(--border-strong);
+  --color-text-muted: var(--text-muted);
+  --color-neutral-bubble: var(--neutral-bubble);
+  --color-chart-1: var(--chart-1);
+  --color-chart-2: var(--chart-2);
+  --color-chart-3: var(--chart-3);
+  --color-chart-4: var(--chart-4);
+  --font-sans: var(--font-geist-sans), ui-sans-serif, system-ui, sans-serif;
+  --font-mono: var(--font-geist-mono), ui-monospace, SFMono-Regular, monospace;
+}
+
+body {
+  background: var(--background);
+  color: var(--foreground);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+/* Custom scrollbar */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: #cbd5e1;
+  border-radius: 9999px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: #94a3b8;
+}
+
+/* Base input ring transition */
+input, select, textarea {
+  transition: all 0.2s ease;
+}
+input:focus, select:focus, textarea:focus {
+  outline: none;
+  border-color: #00685f;
+  box-shadow: 0 0 0 3px rgba(0, 104, 95, 0.15);
+}

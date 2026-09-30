@@ -1,0 +1,114 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: eticket
+      POSTGRES_PASSWORD: eticket
+      POSTGRES_DB: eticket
+    # เปิดให้เครื่องตัวเองเท่านั้น (ใช้รัน test/เครื่องมือ DB จาก host) — ไม่ให้ LAN/อินเทอร์เน็ตเข้าถึง
+    ports:
+      - "127.0.0.1:5434:5432"
+    volumes:
+      - eticket_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U eticket -d eticket"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:6381:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  backend:
+    build: ./backend
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      # ทับค่า DATABASE_URL/REDIS_URL ให้ชี้ container local แทน cloud (Neon/Upstash)
+      # — dotenv (ที่ backend/src/app.js เรียกอยู่แล้ว) ไม่ทับ env var ที่มีค่าอยู่ก่อน
+      # จึงชนะค่าใน .env ที่ mount เข้ามาด้านล่างเสมอ ตัวแปรอื่น (เช่น JWT_SECRET)
+      # ยังอ่านจากไฟล์ backend/.env ตามปกติ
+      DATABASE_URL: postgresql://eticket:eticket@postgres:5432/eticket?schema=public
+      REDIS_URL: redis://redis:6379
+      # อ่านโดย docker-entrypoint.sh (shell) — ตั้ง SEED_DEMO_DATA=false ใน .env เพื่อไม่ให้สร้าง
+      # ร้าน/Event ตัวอย่างกลับมาทุกครั้งที่ backend restart (ใช้บน VM ตอนทดสอบจริง)
+      SEED_DEMO_DATA: ${SEED_DEMO_DATA:-true}
+    ports:
+      - "3000:3000"
+    volumes:
+      # Mount ไฟล์ backend/.env ให้ dotenv ในแอปอ่านเอง เหมือนตอนรันนอก Docker
+      - ./backend/.env:/app/.env:ro
+      - eticket_uploads:/app/uploads
+
+  # เครื่องมือเปิดดู/แก้ฐานข้อมูลผ่านเว็บ — สำหรับนักพัฒนาเท่านั้น ไม่ขึ้นมากับ `docker compose up`
+  # ปกติ ต้องสั่ง `docker compose --profile dev up prisma-studio` แล้วเปิด http://localhost:5555
+  prisma-studio:
+    profiles: ["dev"]
+    build: ./backend
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql://eticket:eticket@postgres:5432/eticket?schema=public
+    command: npx prisma studio --port 5555 --browser none
+    ports:
+      - "127.0.0.1:5555:5555"
+    volumes:
+      - ./backend/.env:/app/.env:ro
+
+  admin-web:
+    build:
+      context: ./admin-web
+      # ต้องส่งผ่าน build arg เพราะ Next.js inline ค่า NEXT_PUBLIC_* ตอน `next build`
+      # (ที่รันอยู่ใน Dockerfile) ไม่ใช่ตอน container start — ใส่ผ่าน `environment:`
+      # เฉยๆ จะไม่มีผลอะไรเลย ใช้ BACKEND_PUBLIC_URL ตัวเดียวกับที่ mobile ใช้อยู่แล้ว
+      args:
+        NEXT_PUBLIC_API_BASE_URL: ${BACKEND_PUBLIC_URL}
+    restart: unless-stopped
+    depends_on:
+      - backend
+    ports:
+      - "3001:3001"
+
+  mobile:
+    build: ./mobile
+    restart: unless-stopped
+    depends_on:
+      - backend
+    environment:
+      # HOST_LAN_IP มาจาก root .env (ดู .env.example) — ค่าเดียวที่ต้องกรอกเอง
+      # เพราะ container บน Docker Desktop (Windows) หา LAN IP เครื่องแม่เองไม่ได้
+      # Metro/QR ใช้ LAN — มือถือต้องอยู่ WiFi วงเดียวกับเครื่องที่รัน
+      REACT_NATIVE_PACKAGER_HOSTNAME: ${HOST_LAN_IP}
+      # URL ที่แอปยิง API ไปหา — แยกจาก Metro โดยตั้งใจ เพื่อให้ชี้ไป backend ตัวอื่น
+      # (เช่นเซิร์ฟเวอร์จริง) ได้โดยไม่กระทบ Metro (ดู .env.example)
+      EXPO_PUBLIC_API_BASE_URL: ${BACKEND_PUBLIC_URL}
+      # Container รันแบบ detached ไม่มีใครนั่งกด prompt โต้ตอบของ Expo CLI (เช่น
+      # "แนะนำให้ล็อกอินก่อน") — EXPO_OFFLINE ข้าม prompt/เช็คออนไลน์พวกนี้ไปเลย
+      # (ตั้งใจไม่ใช้ CI=1 เพราะปิด hot-reload ไปด้วย ซึ่งจำเป็นสำหรับ dev)
+      EXPO_OFFLINE: "1"
+    ports:
+      - "8081:8081"
+    stdin_open: true
+    tty: true
+
+volumes:
+  # ตั้งชื่อ volume ตายตัว (ไม่ผูกกับ COMPOSE_PROJECT_NAME) เพื่อให้ข้อมูลอยู่ต่อแม้เปลี่ยนชื่อ project
+  # — ถ้ามีโปรเจกต์นี้หลายชุดบนเครื่องเดียวกันและต้องการข้อมูลแยก ให้เปลี่ยนชื่อด้านล่างด้วย
+  eticket_pgdata:
+    name: eticket_pgdata
+  eticket_uploads:
+    name: eticket_uploads

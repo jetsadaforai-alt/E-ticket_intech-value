@@ -1,0 +1,21 @@
+# dependencies / build artifacts
+node_modules/
+.next/
+.expo/
+dist/
+web-build/
+
+# user-uploaded content (vendor documents, event images) — lives in the eticket_uploads
+# Docker volume in deployment (see docker-compose.yml), not in the repo. Local `npm run
+# dev` (outside Docker) writes here directly, so this only matters for non-Docker dev.
+backend/uploads/
+
+# real secrets — never committed, even to a private repo.
+# .env.example files (backend/ and root) ARE committed as templates.
+.env
+backend/.env
+
+# OS/editor cruft
+.DS_Store
+Thumbs.db
+*.tsbuildinfo

@@ -1,0 +1,641 @@
+// E-ticket Mini — Prisma schema
+// Diagram of the main tables: docs/diagrams/13-erd.md
+// 16 entities in PostgreSQL. QRToken lives in Redis (see src/services/qrToken.js), not here.
+
+generator client {
+  provider      = "prisma-client-js"
+  binaryTargets = ["native", "linux-musl-openssl-3.0.x"]
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ── กลุ่มที่ 1: Actor & Ownership ──────────────────────────────
+
+model User {
+  id        String   @id @default(uuid())
+  name      String
+  phone     String   @unique
+  email     String?
+  avatarUrl String?  @map("avatar_url")
+  googleId  String?  @unique @map("google_id") // placeholder — OAuth not implemented yet
+  lineId    String?  @unique @map("line_id")   // placeholder — OAuth not implemented yet
+  // active | suspended — Admin can suspend an abusive account. Unlike Event.status
+  // 'banned', this is reversible: it only locks the account out, so there is an
+  // unsuspend path. What does NOT come back on unsuspend is
+  // whatever the suspension already cancelled (held tickets) — see cancelTicketsHeldBy.
+  status              String    @default("active")
+  suspendedAt         DateTime? @map("suspended_at")
+  suspendedReason     String?   @map("suspended_reason")
+  suspendedByAdminId  String?   @map("suspended_by_admin_id")
+  createdAt DateTime @default(now()) @map("created_at")
+
+  vendorOwnerships     VendorOwnership[]
+  shopStaffAssignments ShopStaffAssignment[]
+  heldTickets          Ticket[]               @relation("TicketHolder")
+  sharesGiven          ShareRecord[]          @relation("ShareFrom")
+  sharesClaimed        ShareRecord[]          @relation("ShareClaimedBy")
+  redemptionsAsStaff   Redemption[]           @relation("RedemptionStaff")
+  notifications        Notification[]
+  supportTicketsRaised SupportTicket[]
+  conversations        Conversation[]
+  eventReviews         EventReview[]
+  // No onDelete: keeps the audit trail of who suspended this account even if that
+  // admin account is later removed (same reasoning as Event.bannedByAdmin).
+  suspendedByAdmin     AdminAccount?          @relation("UserSuspendedBy", fields: [suspendedByAdminId], references: [id])
+
+  @@map("users")
+}
+
+model Vendor {
+  id                  String   @id @default(uuid())
+  name                String
+  verificationStatus  String   @default("pending") @map("verification_status") // pending | approved | rejected
+  // active | suspended — separate axis from verificationStatus on purpose. rejected can
+  // be appealed up to 5 times (appealCount); suspended is a moderation penalty on an
+  // already-approved vendor and carries no appeal counter. Folding suspended into
+  // verificationStatus would make unsuspend ambiguous (was it pending or approved
+  // before?) and would tangle appealCount into a flow it doesn't apply to.
+  status              String    @default("active")
+  suspendedAt         DateTime? @map("suspended_at")
+  suspendedReason     String?   @map("suspended_reason")
+  suspendedByAdminId  String?   @map("suspended_by_admin_id")
+  createdAt           DateTime @default(now()) @map("created_at")
+
+  owners       VendorOwnership[]
+  shop         Shop?
+  verification VendorVerification?
+  quota        VendorQuota?
+  purchases    Purchase[]
+  quotaLedgers QuotaLedger[]
+  documents    VendorDocument[]
+  // No onDelete — same audit-trail reasoning as User.suspendedByAdmin.
+  suspendedByAdmin AdminAccount? @relation("VendorSuspendedBy", fields: [suspendedByAdminId], references: [id])
+
+  @@map("vendors")
+}
+
+model VendorOwnership {
+  userId   String @map("user_id")
+  vendorId String @map("vendor_id")
+  role     String @default("owner")
+
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+  vendor Vendor @relation(fields: [vendorId], references: [id], onDelete: Cascade)
+
+  @@id([userId, vendorId])
+  @@map("vendor_ownerships")
+}
+
+// เอกสารยืนยันตัวตนที่แนบตอนสมัครร้านค้า (บัตร ปชช./ใบอนุญาตร้าน ฯลฯ) — Admin ดูตอนตรวจ
+// verification queue มิเรอร์ EventImage แต่ผูกกับ Vendor ตรงๆ ไม่ใช่ VendorVerification
+// เพราะเอกสารควรอยู่ติดกับตัวร้านแม้ผ่านการยื่นอุทธรณ์ใหม่หลายรอบ
+model VendorDocument {
+  id          String   @id @default(uuid())
+  vendorId    String   @map("vendor_id")
+  documentUrl String   @map("document_url") // relative path on local disk
+  createdAt   DateTime @default(now()) @map("created_at")
+
+  vendor Vendor @relation(fields: [vendorId], references: [id], onDelete: Cascade)
+
+  @@map("vendor_documents")
+}
+
+model Shop {
+  id       String  @id @default(uuid())
+  vendorId String  @unique @map("vendor_id") // 1 vendor : 1 shop
+  name     String
+  address  String
+  logoUrl  String? @map("logo_url") // relative path on disk, same convention as Product.imageUrl
+
+  vendor              Vendor                 @relation(fields: [vendorId], references: [id], onDelete: Cascade)
+  staffAssignments    ShopStaffAssignment[]
+  events              Event[]
+  conversations       Conversation[]
+  products            Product[]
+
+  @@map("shops")
+}
+
+// สินค้าของร้าน มีไว้ให้ event ระบุได้ว่าลดเฉพาะชิ้นไหน
+// Event ที่ไม่ผูกสินค้าเลย = ส่วนลดใช้ได้ทั้งร้าน ซึ่งเป็นพฤติกรรมเดิมก่อนมีตารางนี้
+model Product {
+  id        String   @id @default(uuid())
+  shopId    String   @map("shop_id")
+  name      String
+  priceBaht Decimal  @map("price_baht") @db.Decimal(10, 2) // ราคาปกติ ใช้คำนวณราคาหลังลด
+  imageUrl  String?  @map("image_url") // relative path บนดิสก์ เหมือน EventImage — อัปโหลดทีหลังได้
+  // active | archived — ร้าน "ลบ" สินค้าได้แค่ซ่อน ไม่ลบแถวจริง เพราะถ้าลบแล้วลิงก์หายตาม
+  // event ที่เคยลดเฉพาะชิ้นนั้นจะเหลือสินค้า 0 ชิ้น = กลายเป็นลดทั้งร้านโดยไม่มีใครสั่ง
+  status    String   @default("active")
+  sortOrder Int      @default(0) @map("sort_order")
+  createdAt DateTime @default(now()) @map("created_at")
+
+  shop   Shop           @relation(fields: [shopId], references: [id], onDelete: Cascade)
+  events EventProduct[]
+  redemptions                Redemption[]
+  substitutionsAsOutOfStock  ProductSubstitution[] @relation("SubstitutionOutOfStock")
+  substitutionsAsReplacement ProductSubstitution[] @relation("SubstitutionReplacement")
+
+  @@map("products")
+}
+
+// join table แบบ explicit ตาม VendorOwnership — โปรเจกต์นี้ไม่ใช้ implicit m2m ของ Prisma ที่ไหนเลย
+model EventProduct {
+  eventId   String  @map("event_id")
+  productId String  @map("product_id")
+  // ส่วนลดบาทตายตัวเฉพาะสินค้าชิ้นนี้ในอีเวนต์นี้ — ค่าประวัติศาสตร์สำหรับแถวเก่า (ก่อนฟีเจอร์นี้)
+  // เป็น 0 เฉยๆ ไม่มีความหมายอะไร เพราะ event ตอนนั้นยังลดแบบก้อนเดียวทั้งอีเวนต์ผ่าน
+  // TicketBatch.discountValueBaht — แถวใหม่ทุกแถวถูก route validate ให้มีค่าจริงเสมอก่อนเขียน
+  discountValueBaht Decimal @default(0) @map("discount_value_baht") @db.Decimal(10, 2)
+
+  event   Event   @relation(fields: [eventId], references: [id], onDelete: Cascade)
+  product Product @relation(fields: [productId], references: [id], onDelete: Cascade)
+
+  @@id([eventId, productId])
+  @@map("event_products")
+}
+
+model ShopStaffAssignment {
+  id         String   @id @default(uuid())
+  userId     String   @map("user_id")
+  shopId     String   @map("shop_id")
+  role       String   // manager | staff
+  // invited = เชิญแล้วรอตอบ · active = ใช้งานอยู่ · rejected = ปฏิเสธคำเชิญ · removed = ถูกลบออก
+  // การเชิญซ้ำและรายชื่อพนักงานนับเฉพาะ ['active','invited'] → rejected/removed เชิญใหม่ได้
+  status     String   @default("active")
+  invitedBy  String?  @map("invited_by")
+  createdAt  DateTime @default(now()) @map("created_at")
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+  shop Shop @relation(fields: [shopId], references: [id], onDelete: Cascade)
+
+  @@map("shop_staff_assignments")
+}
+
+// ── กลุ่มที่ 1.5: Admin ────────────────────────────────────────
+
+model AdminAccount {
+  id           String   @id @default(uuid())
+  username     String   @unique
+  passwordHash String   @map("password_hash")
+  phone        String   @unique
+  role         String   // admin | super_admin
+  status       String   @default("active") // active | disabled
+  createdBy    String?  @map("created_by")
+  createdAt    DateTime @default(now()) @map("created_at")
+
+  verificationsReviewed VendorVerification[] @relation("ReviewedBy")
+  assignedSupportTickets SupportTicket[]
+  packagesUpdated        Package[]           @relation("PackageUpdatedBy")
+  eventsBanned           Event[]             @relation("EventBannedBy")
+  usersSuspended         User[]              @relation("UserSuspendedBy")
+  vendorsSuspended       Vendor[]            @relation("VendorSuspendedBy")
+
+  @@map("admin_accounts")
+}
+
+model VendorVerification {
+  id                String    @id @default(uuid())
+  vendorId          String    @unique @map("vendor_id")
+  status            String    @default("pending") // pending | approved | rejected
+  reason            String?
+  appealCount       Int       @default(0) @map("appeal_count") // max 5
+  lastAppealReason  String?   @map("last_appeal_reason")
+  reviewedBy        String?   @map("reviewed_by")
+  reviewedAt        DateTime? @map("reviewed_at")
+  createdAt         DateTime  @default(now()) @map("created_at")
+
+  vendor   Vendor        @relation(fields: [vendorId], references: [id], onDelete: Cascade)
+  reviewer AdminAccount? @relation("ReviewedBy", fields: [reviewedBy], references: [id])
+
+  @@map("vendor_verifications")
+}
+
+// ── กลุ่มที่ 3: Event & Ticket (core) ──────────────────────────
+
+model Event {
+  id          String   @id @default(uuid())
+  shopId      String   @map("shop_id")
+  title       String
+  description String?  // nullable, <=2000 chars — enforced at application layer
+  // food_drink | music | workshops — matches HomeScreen's category chips. Default only
+  // backfills pre-existing rows during migration; the create endpoint always requires an
+  // explicit value.
+  category    String   @default("food_drink")
+  startTime   DateTime @map("start_time")
+  endTime     DateTime @map("end_time")
+  status      String   @default("active") // active | expired | cancelled | banned
+  // Admin moderation, set only when status becomes 'banned'. A ban is permanent: it
+  // cancels tickets that were already in customers' hands, and those cannot be handed
+  // back, so there is no un-ban path and no reason to model one.
+  bannedAt        DateTime? @map("banned_at")
+  bannedReason    String?   @map("banned_reason")
+  bannedByAdminId String?   @map("banned_by_admin_id")
+  // Snapshot of the vendor's per-event ticket ceiling at creation time. Snapshotted
+  // rather than read from Package on demand because SuperAdmin can edit the ceiling
+  // and vendors can change tier — neither may retroactively move an existing event's
+  // limit. Ticket top-ups bought for this event raise it.
+  ticketCap   Int      @default(0) @map("ticket_cap")
+  createdAt   DateTime @default(now()) @map("created_at")
+  // Set once this (ended) event has been relaunched into a new one, via POST
+  // /v1/events/:id/relaunch — a source can only be relaunched once (@unique means the
+  // reverse lookup, "which event was this born from", is also 1:1), so the vendor sees
+  // "เปิดใหม่แล้ว" pointing at the real successor instead of a "เปิดใหม่" button that would
+  // spawn a second, disconnected copy of the same promotion.
+  relaunchedToEventId String? @unique @map("relaunched_to_event_id")
+
+  shop              Shop                     @relation(fields: [shopId], references: [id], onDelete: Cascade)
+  images            EventImage[]
+  redemptionWindow  EventRedemptionWindow?
+  ticketBatch       TicketBatch?
+  ticketTopups      Purchase[]
+  // ว่างได้ = ส่วนลดใช้ได้ทั้งร้าน (ไม่บังคับผูกสินค้า)
+  products          EventProduct[]
+  reviews           EventReview[]
+  // No onDelete: this records who took a moderation action, and losing that with the
+  // admin account would erase the audit trail (same reasoning as Redemption.staff).
+  bannedByAdmin     AdminAccount?            @relation("EventBannedBy", fields: [bannedByAdminId], references: [id])
+  productSubstitutions ProductSubstitution[]
+  relaunchedTo      Event?                   @relation("EventRelaunch", fields: [relaunchedToEventId], references: [id])
+  relaunchedFrom    Event?                   @relation("EventRelaunch")
+
+  @@map("events")
+}
+
+// รีวิวผูกกับ "event" ไม่ใช่ "ร้าน" เพราะคนเขียนจากประสบการณ์โปรครั้งนั้น ๆ — โปรคนละใบ
+// ของร้านเดียวกันคุณภาพต่างกันได้ · หน้า UI ยังโชว์ค่าเฉลี่ยระดับร้านด้วย แต่คำนวณสดจากรีวิว
+// ของทุก event ในร้าน ไม่เก็บ counter ซ้ำไว้บน Shop/Event (หลักเดียวกับที่ไม่มี ShopWallet)
+//
+// รีวิวได้เฉพาะคนที่ "ใช้สิทธิ์แล้วจริง" — ตัวชี้ขาดคือ Ticket.currentHolderUserId ของตั๋วที่
+// status = REDEEMED ไม่ใช่ Redemption.staffId (นั่นคือพนักงานที่สแกน ไม่ใช่ลูกค้า)
+model EventReview {
+  id        String   @id @default(uuid())
+  eventId   String   @map("event_id")
+  userId    String   @map("user_id")
+  rating    Int // 1..5 — แสดงผลเป็นเกรด F/D/C/B/A ฝั่ง UI (5=A ... 1=F) แต่เก็บเป็นตัวเลขเดิม
+  comment   String? // ไม่บังคับ — ให้คะแนนเฉย ๆ ก็ได้
+  photoUrl  String?  @map("photo_url") // แนบรูปได้ 1 รูป ไม่บังคับ
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  event Event @relation(fields: [eventId], references: [id], onDelete: Cascade)
+  user  User  @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([eventId, userId]) // 1 คน : 1 event = 1 รีวิว — เขียนซ้ำ = แก้ของเดิม ไม่เพิ่มใบใหม่
+  @@index([eventId, createdAt])
+  @@map("event_reviews")
+}
+
+model EventImage {
+  id        String   @id @default(uuid())
+  eventId   String   @map("event_id")
+  imageUrl  String   @map("image_url") // relative path on local disk
+  sortOrder Int      @default(0) @map("sort_order")
+  createdAt DateTime @default(now()) @map("created_at")
+
+  event Event @relation(fields: [eventId], references: [id], onDelete: Cascade)
+
+  @@map("event_images")
+}
+
+model EventRedemptionWindow {
+  id         String    @id @default(uuid())
+  eventId    String    @unique @map("event_id") // 1:1 optional
+  validFrom  DateTime? @map("valid_from") @db.Date
+  validUntil DateTime? @map("valid_until") @db.Date
+  createdAt  DateTime  @default(now()) @map("created_at")
+
+  event Event                   @relation(fields: [eventId], references: [id], onDelete: Cascade)
+  slots EventRedemptionSlot[]
+
+  @@map("event_redemption_windows")
+}
+
+model EventRedemptionSlot {
+  id                   String @id @default(uuid())
+  redemptionWindowId   String @map("redemption_window_id")
+  dayOfWeek            String @map("day_of_week") // MON..SUN
+  startTime            String @map("start_time")  // "HH:mm", evaluated in Asia/Bangkok
+  endTime              String @map("end_time")
+
+  window EventRedemptionWindow @relation(fields: [redemptionWindowId], references: [id], onDelete: Cascade)
+
+  @@map("event_redemption_slots")
+}
+
+model TicketBatch {
+  id                 String  @id @default(uuid())
+  eventId            String  @unique @map("event_id") // 1:1
+  totalQty           Int     @map("total_qty")
+  remainingCount     Int     @map("remaining_count")
+  // ส่วนลดก้อนเดียวทั้งอีเวนต์ — ยังคงความหมายเดิมเป๊ะสำหรับอีเวนต์ที่ไม่ผูกสินค้า (ลดทั้งร้าน)
+  // สำหรับอีเวนต์ที่ผูกสินค้าเฉพาะเจาะจง (ดู EventProduct.discountValueBaht) คอลัมน์นี้ถูกตั้งให้
+  // เท่ากับ fallbackDiscountValueBaht ไปด้วยเพื่อ backward-compat เฉยๆ (กันโค้ดเก่าที่ยังไม่รู้จัก
+  // per-product พังจาก null) — โค้ดใหม่ต้องอ่าน fallbackDiscountValueBaht เป็นค่าจริงเสมอ ไม่ใช่ตัวนี้
+  discountValueBaht          Decimal  @map("discount_value_baht") @db.Decimal(10, 2)
+  // ส่วนลดสำรองที่ vendor ตั้งเองตอนสร้างอีเวนต์ที่ผูกสินค้า — ใช้ตอนพนักงานกด "สินค้าหมด" ระหว่าง
+  // สแกน (ไม่มีสินค้าเจาะจงให้อ้างอิงราคาลด) null สำหรับอีเวนต์ที่ไม่ผูกสินค้าเลย (ไม่มีทางหมดได้)
+  fallbackDiscountValueBaht  Decimal? @map("fallback_discount_value_baht") @db.Decimal(10, 2)
+
+  event   Event    @relation(fields: [eventId], references: [id], onDelete: Cascade)
+  tickets Ticket[]
+
+  @@map("ticket_batches")
+}
+
+model Ticket {
+  id                   String    @id @default(uuid())
+  batchId              String    @map("batch_id")
+  code                 String    @unique
+  // RESERVED ไม่มี code path ไหนตั้งค่า — mini ใช้ flow ขั้นตอนเดียว
+  // คงค่าไว้เผื่อเพิ่ม Reserve→Confirm กลับมา: เป็น String ไม่ใช่ enum จึงไม่ต้อง migrate ตอนนั้น
+  status               String    @default("AVAILABLE") // AVAILABLE|RESERVED|ISSUED|REDEEMED|CANCELLED|EXPIRED
+  currentHolderUserId  String?   @map("current_holder_user_id")
+  issuedAt             DateTime? @map("issued_at")
+
+  batch      TicketBatch    @relation(fields: [batchId], references: [id], onDelete: Cascade)
+  holder     User?          @relation("TicketHolder", fields: [currentHolderUserId], references: [id])
+  redemption Redemption?
+  shares     ShareRecord[]
+
+  @@map("tickets")
+}
+
+model Redemption {
+  id                  String   @id @default(uuid())
+  ticketId            String   @unique @map("ticket_id") // 1 ticket redeems once
+  staffId             String   @map("staff_id")
+  discountValueBaht   Decimal  @map("discount_value_baht") @db.Decimal(10, 2)
+  redeemedAt          DateTime @default(now()) @map("redeemed_at")
+  // Which of the event's linked products the customer actually walked away with — null
+  // when the event has no products linked (whole-shop discount, no ambiguity to record),
+  // or when staff hasn't confirmed one yet (see productUnavailable below). Never backfilled
+  // for redemptions that predate this field; a compare-events dashboard must tell that
+  // "unspecified" case apart from a genuine no-choice-needed case using event_products.
+  productId           String?  @map("product_id")
+  // Staff-declared "none of this event's linked products were physically available" for
+  // this one transaction. Separate from productId being null on purpose: this app has no
+  // real inventory count (Product has no stock quantity), so it can never detect a
+  // stock-out itself — only a staff member at the counter can say so. Redemption/discount
+  // usage must never be blocked by a shop's stock-out, so this is just a data flag, not a
+  // gate. A dashboard needs this distinct from "unspecified" (productId null AND this
+  // false) since one is a real signal (a product selling out) and the other is just
+  // missing data.
+  productUnavailable  Boolean  @default(false) @map("product_unavailable")
+
+  ticket  Ticket   @relation(fields: [ticketId], references: [id], onDelete: Cascade)
+  staff   User     @relation("RedemptionStaff", fields: [staffId], references: [id])
+  product Product? @relation(fields: [productId], references: [id])
+
+  @@map("redemptions")
+}
+
+// Records that a shop swapped one product for another on a specific event because the
+// original ran out physically (no real inventory tracking exists — see Redemption.
+// productUnavailable). Deliberately event-scoped and separate from Redemption: this is a
+// fact about the event's product lineup changing at a point in time, not a property of
+// any one customer's transaction, and keeping it here means a compare-events dashboard can
+// read "this event had N stock-outs, here's what replaced what" directly instead of
+// inferring it from how Redemption.productId happens to shift over the event's lifetime.
+model ProductSubstitution {
+  id                  String   @id @default(uuid())
+  eventId             String   @map("event_id")
+  outOfStockProductId String   @map("out_of_stock_product_id")
+  substituteProductId String   @map("substitute_product_id")
+  createdAt           DateTime @default(now()) @map("created_at")
+
+  event             Event   @relation(fields: [eventId], references: [id], onDelete: Cascade)
+  outOfStockProduct Product @relation("SubstitutionOutOfStock", fields: [outOfStockProductId], references: [id])
+  substituteProduct Product @relation("SubstitutionReplacement", fields: [substituteProductId], references: [id])
+
+  @@map("product_substitutions")
+}
+
+model ShareRecord {
+  id                String    @id @default(uuid())
+  ticketId          String    @map("ticket_id")
+  fromUserId        String    @map("from_user_id")
+  shareToken        String    @unique @map("share_token")
+  claimedByUserId   String?   @map("claimed_by_user_id")
+  claimedAt         DateTime? @map("claimed_at")
+  expiresAt         DateTime  @map("expires_at")
+  createdAt         DateTime  @default(now()) @map("created_at")
+
+  ticket    Ticket @relation(fields: [ticketId], references: [id], onDelete: Cascade)
+  fromUser  User   @relation("ShareFrom", fields: [fromUserId], references: [id])
+  claimedBy User?  @relation("ShareClaimedBy", fields: [claimedByUserId], references: [id])
+
+  @@map("share_records")
+}
+
+// ── กลุ่มที่ 5: Notification ───────────────────────────────────
+
+model Notification {
+  id        String    @id @default(uuid())
+  userId    String    @map("user_id")
+  // ที่ใช้จริง 4 ชนิด: invite_staff | vendor_verification_result | ticket_shared | ticket_received
+  // การยื่นอุทธรณ์ของร้าน (`vendor_appeal_submitted`) **ไม่ได้เขียนลงตารางนี้** —
+  // ผู้รับคือ admin ซึ่งอยู่ใน AdminAccount ส่วน userId ข้างล่างผูกกับ User เท่านั้น
+  // การอุทธรณ์แจ้ง admin ผ่านคิวอนุมัติแทน (ดู routes/vendors.js)
+  type      String
+  payload   Json?
+  readAt    DateTime? @map("read_at")
+  createdAt DateTime  @default(now()) @map("created_at")
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@map("notifications")
+}
+
+// ── กลุ่มที่ 4: Admin & Support ────────────────────────────────
+// Tables behind the admin support-ticket endpoints (/v1/support-tickets, /v1/admin/support-tickets).
+
+model SupportTicket {
+  id               String    @id @default(uuid())
+  raisedByUserId   String    @map("raised_by_user_id")
+  category         String    // redemption_dispute | billing_issue | fraud_report | other
+  status           String    @default("open") // open | investigating | resolved | closed
+  assignedAdminId  String?   @map("assigned_admin_id")
+  resolutionNote   String?   @map("resolution_note")
+  createdAt        DateTime  @default(now()) @map("created_at")
+  resolvedAt       DateTime? @map("resolved_at")
+  // Read-receipt markers, same two-column pattern as Conversation.userLastReadAt/
+  // shopLastReadAt — set when each side opens the thread; a message is "read" once the
+  // other side's marker is >= the message's createdAt.
+  userLastReadAt   DateTime? @map("user_last_read_at")
+  adminLastReadAt  DateTime? @map("admin_last_read_at")
+
+  raisedBy      User           @relation(fields: [raisedByUserId], references: [id], onDelete: Cascade)
+  assignedAdmin AdminAccount?  @relation(fields: [assignedAdminId], references: [id])
+  messages      SupportMessage[]
+
+  @@map("support_tickets")
+}
+
+model SupportMessage {
+  id              String   @id @default(uuid())
+  supportTicketId String   @map("support_ticket_id")
+  senderType      String   @map("sender_type") // user | admin
+  senderId        String   @map("sender_id")   // User.id or AdminAccount.id depending on senderType
+  message         String
+  createdAt       DateTime @default(now()) @map("created_at")
+
+  supportTicket SupportTicket @relation(fields: [supportTicketId], references: [id], onDelete: Cascade)
+
+  @@map("support_messages")
+}
+
+// ── กลุ่มที่ 6: Chat (ลูกค้า ↔ ร้านค้า) ────────────────────────
+
+model Conversation {
+  id     String @id @default(uuid())
+  shopId String @map("shop_id")
+  userId String @map("user_id") // the customer side; the shop side is any active member
+  // Denormalised so the inbox can sort without joining every message thread.
+  lastMessageAt  DateTime  @default(now()) @map("last_message_at")
+  // Unread is derived by counting messages newer than the reader's own marker,
+  // which keeps it to two nullable columns instead of a per-message read table.
+  userLastReadAt DateTime? @map("user_last_read_at")
+  shopLastReadAt DateTime? @map("shop_last_read_at")
+  createdAt      DateTime  @default(now()) @map("created_at")
+
+  shop     Shop          @relation(fields: [shopId], references: [id], onDelete: Cascade)
+  user     User          @relation(fields: [userId], references: [id], onDelete: Cascade)
+  messages ChatMessage[]
+
+  @@unique([shopId, userId]) // 1 ลูกค้า : 1 ร้าน = 1 ห้อง
+  @@map("conversations")
+}
+
+model ChatMessage {
+  id             String   @id @default(uuid())
+  conversationId String   @map("conversation_id")
+  senderType     String   @map("sender_type") // user | shop
+  senderId       String   @map("sender_id")   // always a User.id — the customer, or whichever staff/owner replied
+  message        String
+  createdAt      DateTime @default(now()) @map("created_at")
+
+  conversation Conversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+
+  @@index([conversationId, createdAt])
+  @@map("chat_messages")
+}
+
+// ── กลุ่มที่ 7: Package & Quota (Pay per Event) ────────────────
+// Business model: prepaid credits bought per event, not a monthly subscription.
+// A package grants three things at once — a pool of tickets, a number of events the
+// vendor may create, and a per-event ceiling on how many tickets one event may hold.
+// The pool and the ceiling are independent limits: Copper's 30 tickets cannot all be
+// poured into one event, because that event still caps at 10.
+// Full rules and pricing rationale: docs/HANDOVER.md "แพ็กเกจและโควตา".
+
+model Package {
+  id               String   @id @default(uuid())
+  code             String   @unique // free | copper | silver | gold
+  name             String
+  tier             Int      @unique // 0..3 — ordering is what makes "upgrade only" checkable
+  priceBaht        Decimal  @map("price_baht") @db.Decimal(10, 2)
+  eventQuota       Int      @map("event_quota")
+  ticketPerEvent   Int      @map("ticket_per_event") // also the size of one ticket top-up bundle
+  eventTopupPrice  Decimal  @map("event_topup_price") @db.Decimal(10, 2)
+  ticketTopupPrice Decimal  @map("ticket_topup_price") @db.Decimal(10, 2)
+  // Free deliberately cannot top up — running out is what pushes an upgrade.
+  topupEnabled     Boolean  @default(true) @map("topup_enabled")
+  isActive         Boolean  @default(true) @map("is_active")
+  sortOrder        Int      @default(0) @map("sort_order")
+  updatedByAdminId String?  @map("updated_by_admin_id")
+  createdAt        DateTime @default(now()) @map("created_at")
+  updatedAt        DateTime @updatedAt @map("updated_at")
+
+  updatedByAdmin AdminAccount? @relation("PackageUpdatedBy", fields: [updatedByAdminId], references: [id])
+  vendorQuotas   VendorQuota[]
+  purchases      Purchase[]
+
+  @@map("packages")
+}
+
+model VendorQuota {
+  vendorId         String   @id @map("vendor_id")
+  currentPackageId String   @map("current_package_id")
+  ticketBalance    Int      @default(0) @map("ticket_balance")
+  eventBalance     Int      @default(0) @map("event_balance")
+  updatedAt        DateTime @updatedAt @map("updated_at")
+
+  vendor         Vendor  @relation(fields: [vendorId], references: [id], onDelete: Cascade)
+  currentPackage Package @relation(fields: [currentPackageId], references: [id])
+
+  @@map("vendor_quotas")
+}
+
+model Purchase {
+  id        String @id @default(uuid())
+  vendorId  String @map("vendor_id")
+  type      String // package | event_topup | ticket_topup
+  packageId String @map("package_id")
+  // Prices are copied in at purchase time. SuperAdmin can edit any Package row, and a
+  // receipt issued yesterday must not change when they do — so nothing here may be
+  // re-derived from Package after the fact.
+  packageCodeSnapshot String   @map("package_code_snapshot")
+  unitPriceSnapshot   Decimal  @map("unit_price_snapshot") @db.Decimal(10, 2)
+  quantity            Int      @default(1)
+  amountBaht          Decimal  @map("amount_baht") @db.Decimal(10, 2)
+  ticketQuotaAdded    Int      @default(0) @map("ticket_quota_added")
+  eventQuotaAdded     Int      @default(0) @map("event_quota_added")
+  // Set only when this is a ticket top-up aimed at one specific event's ceiling.
+  targetEventId       String?  @map("target_event_id")
+  status              String   @default("pending") // pending | paid | failed | cancelled
+  createdAt           DateTime @default(now()) @map("created_at")
+  paidAt              DateTime? @map("paid_at")
+
+  vendor      Vendor   @relation(fields: [vendorId], references: [id], onDelete: Cascade)
+  package     Package  @relation(fields: [packageId], references: [id])
+  targetEvent Event?   @relation(fields: [targetEventId], references: [id])
+  payment     Payment?
+
+  @@index([vendorId, createdAt])
+  @@map("purchases")
+}
+
+model Payment {
+  id         String    @id @default(uuid())
+  purchaseId String    @unique @map("purchase_id")
+  provider   String // mock | promptpay | ... (see src/services/payment/)
+  amountBaht Decimal   @map("amount_baht") @db.Decimal(10, 2)
+  status     String    @default("pending") // pending | succeeded | failed | expired
+  // The gateway's own charge id. Unique because it doubles as the webhook idempotency
+  // key — real gateways retry callbacks, and quota must only ever be granted once.
+  providerRef String   @unique @map("provider_ref")
+  payload     Json? // QR payload / redirect URL for the client to display
+  createdAt   DateTime @default(now()) @map("created_at")
+  paidAt      DateTime? @map("paid_at")
+  expiresAt   DateTime? @map("expires_at")
+
+  purchase Purchase @relation(fields: [purchaseId], references: [id], onDelete: Cascade)
+
+  @@map("payments")
+}
+
+model QuotaLedger {
+  id          String   @id @default(uuid())
+  vendorId    String   @map("vendor_id")
+  ticketDelta Int      @map("ticket_delta")
+  eventDelta  Int      @map("event_delta")
+  // purchase | event_created | event_cancelled | event_expired | event_topup | admin_adjust
+  // event_topup = ตั๋วที่ซื้อเพิ่มให้ event หนึ่งโดยเฉพาะ ถูกหักจากกองลงไปอยู่ใน event นั้น
+  // (คู่กับแถว purchase ที่เติมเข้ากอง → ยอดกองสุทธิไม่เปลี่ยน ดู services/quota.js)
+  reason      String
+  refId       String?  @map("ref_id") // Purchase.id or Event.id, depending on reason
+  createdAt   DateTime @default(now()) @map("created_at")
+
+  vendor Vendor @relation(fields: [vendorId], references: [id], onDelete: Cascade)
+
+  @@index([vendorId, createdAt])
+  // Makes double-crediting structurally impossible: one refund per event per reason,
+  // enforced by the database instead of a read-then-check that races. NULL ref_id rows
+  // (admin_adjust) are exempt, since Postgres treats NULLs as distinct here.
+  @@unique([reason, refId])
+  @@map("quota_ledgers")
+}

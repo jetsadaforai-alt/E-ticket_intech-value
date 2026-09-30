@@ -12,6 +12,9 @@
 | แอปมือถือ | React Native (Expo SDK 57) | `mobile/` | ลูกค้า, เจ้าของร้าน, พนักงาน |
 | เว็บหลังบ้าน | Next.js | `admin-web/` | Admin, SuperAdmin |
 
+**เริ่มอ่านที่ [docs/PROJECT_GUIDE.md](docs/PROJECT_GUIDE.md)** — วัตถุประสงค์ด้านธุรกิจและผลิตภัณฑ์
+และแผนที่ว่าอะไรอยู่ตรงไหนในโปรเจกต์
+
 เอกสารสำหรับทีมที่รับช่วงต่อ (สถาปัตยกรรม, env ทั้งหมด, การ deploy, ข้อจำกัดที่รู้อยู่) อยู่ที่
 **[docs/HANDOVER.md](docs/HANDOVER.md)** ส่วนแผนภาพลำดับการทำงานของแต่ละ API อยู่ที่
 [docs/diagrams/](docs/diagrams/00-index.md)
